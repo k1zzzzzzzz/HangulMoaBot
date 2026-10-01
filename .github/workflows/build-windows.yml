@@ -24,7 +24,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --noconsole hangul_moa_bot.py
+          pyinstaller --onefile hangul_moa_bot.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
