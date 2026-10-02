@@ -22,7 +22,7 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Patch solver bug
+      - name: Fix solver bug
         shell: pwsh
         run: |
           $file = "hangul_moa_bot.py"
@@ -33,32 +33,20 @@ jobs:
 
           if ($text.Contains($old)) {
             $text = $text.Replace($old, $new)
-            Write-Host "Solver FIX applied"
+            Write-Host "SOLVER FIX APPLIED"
           }
           elseif ($text.Contains($new)) {
-            Write-Host "Solver FIX already applied"
+            Write-Host "SOLVER FIX ALREADY APPLIED"
           }
           else {
-            throw "Solver FIX target not found"
-          }
-
-          $old = "            int(round((x - minx) / cx)),`n            int(round((y - miny) / cy)),"
-          $new = "            int(round((y - miny) / cy)),`n            int(round((x - minx) / cx)),"
-
-          if ($text.Contains($old)) {
-            $text = $text.Replace($old, $new)
-            Write-Host "Piece coordinate FIX applied"
-          }
-          elseif ($text.Contains($new)) {
-            Write-Host "Piece coordinate FIX already applied"
-          }
-          else {
-            throw "Piece coordinate FIX target not found"
+            throw "Solver fix target not found"
           }
 
           Set-Content $file $text -Encoding UTF8
 
-          Write-Host "All patches completed."
+          Write-Host "========================================"
+          Write-Host "SOURCE PATCH COMPLETE"
+          Write-Host "========================================"
 
       - name: Check Python syntax
         run: |
