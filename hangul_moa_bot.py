@@ -1,31 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-MapleStory "한글 모아모아" helper/bot.
-
-Windows / Python 3.10+.
-The program uses screen recognition + a beam-search block-placement solver,
-then controls the mouse with PyAutoGUI.
-
-IMPORTANT:
-- Start the mini-game yourself and keep the game visible.
-- For the most reliable skill tracking, start a fresh round (0 skill charges)
-  before starting this program.
-- F9 = emergency stop
-- F8 = pause/resume
-- F6 = recalibrate
-"""
-
-from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
-import threading
+import traceback
 from dataclasses import dataclass
-from itertools import permutations
 from pathlib import Path
 
 import cv2
@@ -37,774 +18,1604 @@ try:
 except Exception:
     keyboard = None
 
-# Windows DPI awareness: prevents Windows display scaling from making
-# PyAutoGUI coordinates disagree with screenshot coordinates.
-if sys.platform == "win32":
+
+# ============================================================
+# 기본 설정
+# ============================================================
+
+COLS = 10
+ROWS = 16
+FULL_MASK = (1 << COLS) - 1
+
+CONFIG_FILE = Path("hangul_moa_bot_config.json")
+DEBUG_DIR = Path("debug")
+
+pyautogui.PAUSE = 0.04
+pyautogui.FAILSAFE = True
+
+
+# ============================================================
+# 데이터
+# ============================================================
+
+@dataclass
+class Piece:
+    slot: int
+    cells: tuple
+    source_xy: tuple
+    bbox: tuple
+    confidence: float
+
+
+# ============================================================
+# DPI
+# ============================================================
+
+def set_dpi_awareness():
+    if os.name != "nt":
+        return
+
     try:
         import ctypes
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
 
-CONFIG_PATH = Path(__file__).with_name("hangul_moa_config.json")
 
-COLS = 10
-ROWS = 16
-FULL_MASK = (1 << COLS) - 1
+# ============================================================
+# 화면
+# ============================================================
 
-STOP = threading.Event()
-PAUSE = threading.Event()
-PAUSE.clear()
+def screenshot():
+    return np.array(pyautogui.screenshot())
 
 
-@dataclass
-class Piece:
-    slot: int
-    cells: tuple[tuple[int, int], ...]   # normalized (r,c)
-    anchor: tuple[int, int]              # block used as mouse-drag anchor
-    source_xy: tuple[int, int]            # screen coordinate of anchor block
+def save_debug(name, img):
+    DEBUG_DIR.mkdir(exist_ok=True)
 
-    @property
-    def size(self):
-        return len(self.cells)
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(str(DEBUG_DIR / name), img)
 
 
-def norm_shape(cells):
-    cells = list(cells)
+# ============================================================
+# 도형
+# ============================================================
+
+def normalize_shape(cells):
+    if not cells:
+        return tuple()
+
     min_r = min(r for r, c in cells)
     min_c = min(c for r, c in cells)
-    out = sorted((r - min_r, c - min_c) for r, c in cells)
-    return tuple(out)
+
+    return tuple(
+        sorted(
+            (r - min_r, c - min_c)
+            for r, c in cells
+        )
+    )
 
 
-def rotate_shape(cells):
-    # 90 degrees clockwise in grid coordinates.
-    return norm_shape([(c, -r) for r, c in cells])
+def rotate_shape(shape):
+    return normalize_shape(
+        [(c, -r) for r, c in shape]
+    )
 
 
-def flip_shape(cells):
-    # Horizontal mirror.
-    return norm_shape([(r, -c) for r, c in cells])
+def flip_shape(shape):
+    return normalize_shape(
+        [(r, -c) for r, c in shape]
+    )
 
 
-def all_orientations(cells):
+def orientations(shape):
+    result = []
     seen = set()
-    cur = norm_shape(cells)
-    for _ in range(4):
-        for s in (cur, flip_shape(cur)):
-            s = norm_shape(s)
-            if s not in seen:
-                seen.add(s)
-        cur = rotate_shape(cur)
-    return list(seen)
+
+    original = normalize_shape(shape)
+
+    for flipped in range(2):
+
+        cur = flip_shape(original) if flipped else original
+
+        for _ in range(4):
+
+            cur = normalize_shape(cur)
+
+            if cur not in seen:
+                seen.add(cur)
+                result.append(cur)
+
+            cur = rotate_shape(cur)
+
+    return result
 
 
-def transform_by_sequence(cells, seq):
-    s = norm_shape(cells)
-    for a in seq:
-        s = rotate_shape(s) if a == "R" else flip_shape(s)
-    return s
+def transform_sequence(original, target):
+    target = normalize_shape(target)
+
+    base = normalize_shape(original)
+
+    for flipped in range(2):
+
+        cur = flip_shape(base) if flipped else base
+        sequence = ["F"] if flipped else []
+
+        for _ in range(4):
+
+            if normalize_shape(cur) == target:
+                return sequence
+
+            cur = rotate_shape(cur)
+            sequence.append("R")
+
+    return None
 
 
-def find_transform_sequence(src, dst):
-    src = norm_shape(src)
-    dst = norm_shape(dst)
-    if src == dst:
-        return []
-    # The dihedral group is tiny; BFS is enough.
-    q = [(src, [])]
-    seen = {src}
-    while q:
-        s, path = q.pop(0)
-        for a in ("R", "F"):
-            ns = rotate_shape(s) if a == "R" else flip_shape(s)
-            if ns in seen:
-                continue
-            npth = path + [a]
-            if ns == dst:
-                return npth
-            seen.add(ns)
-            if len(npth) < 8:
-                q.append((ns, npth))
-    return []
+# ============================================================
+# 보드
+# ============================================================
 
+def place_piece(board, shape, top, left):
 
-def shape_masks(cells):
-    """Convert a normalized shape into row bit masks."""
-    d = {}
-    for r, c in cells:
-        d[r] = d.get(r, 0) | (1 << c)
-    return tuple(sorted(d.items()))
+    rows = list(board)
 
+    for dr, dc in shape:
 
-def place_rows(rows_bits, shape, top, left):
-    """Return (new_rows, cleared_count, valid)."""
-    rows2 = list(rows_bits)
-    for r, c in shape:
-        rr = top + r
-        cc = left + c
-        if rr < 0 or rr >= ROWS or cc < 0 or cc >= COLS:
-            return None, 0, False
-        if rows2[rr] & (1 << cc):
-            return None, 0, False
-    for r, c in shape:
-        rows2[top + r] |= 1 << (left + c)
+        r = top + dr
+        c = left + dc
+
+        if r < 0 or r >= ROWS:
+            return None
+
+        if c < 0 or c >= COLS:
+            return None
+
+        bit = 1 << c
+
+        if rows[r] & bit:
+            return None
+
+        rows[r] |= bit
+
     cleared = 0
+
     for r in range(ROWS):
-        if rows2[r] == FULL_MASK:
-            rows2[r] = 0
+
+        if rows[r] == FULL_MASK:
+            rows[r] = 0
             cleared += 1
-    return tuple(rows2), cleared, True
+
+    return tuple(rows), cleared
 
 
-def legal_moves(rows_bits, shape):
+def legal_moves(board, shape):
+
+    if not shape:
+        return
+
     h = max(r for r, c in shape) + 1
     w = max(c for r, c in shape) + 1
+
     for r in range(ROWS - h + 1):
+
         for c in range(COLS - w + 1):
-            nr, cleared, ok = place_rows(rows_bits, shape, r, c)
-            if ok:
-                yield r, c, nr, cleared
+
+            result = place_piece(
+                board,
+                shape,
+                r,
+                c
+            )
+
+            if result is not None:
+
+                new_board, cleared = result
+
+                yield r, c, new_board, cleared
 
 
-def row_quality(rows_bits):
-    counts = [int(x.bit_count()) for x in rows_bits]
-    # Completing/near-completing rows is valuable because it creates
-    # future line clears without forcing a particular column height.
-    near8 = sum(1 for x in counts if x == 8)
-    near7 = sum(1 for x in counts if x == 7)
-    near6 = sum(1 for x in counts if x == 6)
+# ============================================================
+# 보드 평가
+# ============================================================
 
-    # Penalize very dense boards slightly. This prevents the solver from
-    # greedily filling cells without preserving maneuvering room.
+def board_score(board):
+
+    counts = [
+        row.bit_count()
+        for row in board
+    ]
+
+    near7 = sum(x == 7 for x in counts)
+    near8 = sum(x == 8 for x in counts)
+    near9 = sum(x == 9 for x in counts)
+
+    roughness = sum(
+        abs(counts[i] - counts[i + 1])
+        for i in range(ROWS - 1)
+    )
+
     occupied = sum(counts)
 
-    # Penalize abrupt row-density changes. It is only a weak tie-breaker.
-    rough = sum(abs(counts[i] - counts[i + 1]) for i in range(ROWS - 1))
-    return 22 * near8 + 8 * near7 + 2 * near6 - 0.25 * occupied - 0.25 * rough
+    score = 0
+
+    score += near7 * 8
+    score += near8 * 20
+    score += near9 * 35
+
+    score -= roughness * 0.25
+    score -= occupied * 0.05
+
+    return score
 
 
-def mobility(rows_bits, shapes):
+def mobility(board, pieces):
+
     total = 0
-    for s in shapes:
-        total += sum(1 for _ in legal_moves(rows_bits, s))
-    return min(total, 80)
+
+    for p in pieces:
+
+        for shape in orientations(p.cells):
+
+            total += sum(
+                1
+                for _ in legal_moves(board, shape)
+            )
+
+    return min(total, 100)
 
 
-def evaluate_state(rows_bits, score, remaining_shapes):
-    return score + row_quality(rows_bits) + 0.35 * mobility(rows_bits, remaining_shapes)
+# ============================================================
+# AI
+# ============================================================
 
+def solve(board, pieces, beam_width=60):
 
-def solve_current_pieces(rows_bits, pieces, beam_width=45):
-    """
-    Beam-search all useful orderings of the currently available pieces.
-    Returns the first move (slot, orientation, row, col) from the best
-    sequence found.
-    """
     if not pieces:
         return None
 
-    # State: (board, used_mask, score, first_move, depth)
-    states = [(tuple(rows_bits), 0, 0, None, 0)]
+    # board, 사용한 조각 비트, 점수, 첫 수
+    states = [
+        (tuple(board), 0, 0.0, None)
+    ]
 
-    # We can use each currently available piece at most once before new
-    # pieces appear. Search depth up to all available pieces.
-    depth_limit = len(pieces)
+    for depth in range(len(pieces)):
 
-    for depth in range(depth_limit):
         candidates = []
-        for board, used, score, first, _ in states:
-            for i, p in enumerate(pieces):
+
+        for state_board, used, score, first in states:
+
+            for i, piece in enumerate(pieces):
+
                 if used & (1 << i):
                     continue
-                for orient in all_orientations(p.cells):
-                    for r, c, nb, cleared in legal_moves(board, orient):
-                        gain = len(orient) + 300 * (cleared ** 2)
-                        ns = score + gain
-                        fm = first
-                        if fm is None:
-                            fm = (p.slot, orient, r, c)
+
+                for shape in orientations(piece.cells):
+
+                    for r, c, new_board, cleared in legal_moves(
+                        state_board,
+                        shape
+                    ):
+
+                        gain = len(shape)
+
+                        if cleared == 1:
+                            gain += 250
+                        elif cleared == 2:
+                            gain += 700
+                        elif cleared == 3:
+                            gain += 1400
+                        elif cleared >= 4:
+                            gain += 2500
+
+                        new_score = score + gain
+
+                        if first is None:
+                            first_move = (
+                                piece.slot,
+                                shape,
+                                r,
+                                c
+                            )
+                        else:
+                            first_move = first
+
+                        remaining = [
+                            p
+                            for j, p in enumerate(pieces)
+                            if not ((used | (1 << i)) & (1 << j))
+                        ]
+
+                        evaluation = (
+                            new_score
+                            + board_score(new_board)
+                            + mobility(
+                                new_board,
+                                remaining
+                            ) * 0.30
+                        )
+
                         candidates.append(
                             (
-                                evaluate_state(
-                                    nb,
-                                    ns,
-                                    [
-                                        q.cells
-                                        for j, q in enumerate(pieces)
-                                        if not (used | (1 << i)) & (1 << j)
-                                    ],
-                                ),
-                                nb,
+                                evaluation,
+                                new_board,
                                 used | (1 << i),
-                                ns,
-                                fm,
-                                depth + 1,
+                                new_score,
+                                first_move
                             )
                         )
+
         if not candidates:
             break
-        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        candidates.sort(
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        # 같은 보드 상태 제거
+        unique = []
+        seen = set()
+
+        for candidate in candidates:
+
+            key = (
+                candidate[1],
+                candidate[2]
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique.append(candidate)
+
+            if len(unique) >= beam_width:
+                break
+
         states = [
-            (x[1], x[2], x[3], x[4], x[5])
-            for x in candidates[:beam_width]
+            (
+                x[1],
+                x[2],
+                x[3],
+                x[4]
+            )
+            for x in unique
         ]
 
     if not states:
         return None
-    best = max(states, key=lambda x: evaluate_state(x[0], x[3], []))
-    return best[3], best[2], best[3], best[4]
+
+    best = max(
+        states,
+        key=lambda x: (
+            x[2] +
+            board_score(x[0])
+        )
+    )
+
+    return best[3]
+
+
+# ============================================================
+# 설정
+# ============================================================
+
+def default_config():
+
+    return {
+        "board_x": 500,
+        "board_y": 200,
+
+        "cell_x": 32,
+        "cell_y": 32,
+
+        "panel_x0": 850,
+        "panel_y0": 200,
+
+        "panel_x1": 1100,
+        "panel_y1": 650,
+
+        "rotate_x": 1080,
+
+        "rotate_y": [
+            260,
+            380,
+            500
+        ],
+
+        "flip_y": [
+            290,
+            410,
+            530
+        ],
+
+        "dot_button": [
+            1000,
+            680
+        ],
+
+        "swap_button": [
+            1000,
+            725
+        ]
+    }
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        return None
+
+    if not CONFIG_FILE.exists():
+        return default_config()
+
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+        data = json.loads(
+            CONFIG_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        config = default_config()
+        config.update(data)
+
+        return config
+
     except Exception:
-        return None
+
+        return default_config()
 
 
-def save_config(cfg):
-    CONFIG_PATH.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def save_config(config):
+
+    CONFIG_FILE.write_text(
+        json.dumps(
+            config,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
     )
 
 
-def calibrate():
-    print("\n=== 한글 모아모아 봇 보정 ===")
-    print("게임 창을 화면에 띄워두세요.")
-    print("보드의 '왼쪽 위 칸 정중앙'에 마우스를 올린 뒤 Enter.")
+# ============================================================
+# 보정
+# ============================================================
+
+def calibrate(config):
+
+    print()
+    print("=" * 60)
+    print("보정 시작")
+    print("=" * 60)
+
+    print()
+    print("① 보드 왼쪽 위 칸의 중앙에 마우스를 놓고 Enter")
     input()
-    p1 = pyautogui.position()
 
-    print("이번에는 보드의 '오른쪽 아래 칸 정중앙'에 마우스를 올린 뒤 Enter.")
+    x1, y1 = pyautogui.position()
+
+    print()
+    print("② 보드 오른쪽 아래 칸의 중앙에 마우스를 놓고 Enter")
     input()
-    p2 = pyautogui.position()
 
-    cell_x = (p2.x - p1.x) / (COLS - 1)
-    cell_y = (p2.y - p1.y) / (ROWS - 1)
+    x2, y2 = pyautogui.position()
 
-    if cell_x < 10 or cell_y < 10:
-        raise RuntimeError("보정값이 이상합니다. 게임 보드 안쪽의 칸 중앙을 다시 지정하세요.")
+    cell_x = (x2 - x1) / (COLS - 1)
+    cell_y = (y2 - y1) / (ROWS - 1)
 
-    cfg = {
-        "board_x0": int(p1.x),
-        "board_y0": int(p1.y),
-        "cell_x": float(cell_x),
-        "cell_y": float(cell_y),
-    }
-    save_config(cfg)
-    print(f"저장 완료: {CONFIG_PATH}")
-    print(cfg)
-    return cfg
+    if cell_x <= 5 or cell_y <= 5:
+        raise RuntimeError(
+            "보드 크기 계산 실패"
+        )
 
+    config["board_x"] = x1
+    config["board_y"] = y1
+    config["cell_x"] = cell_x
+    config["cell_y"] = cell_y
 
-def board_center(cfg, r, c):
-    return (
-        round(cfg["board_x0"] + c * cfg["cell_x"]),
-        round(cfg["board_y0"] + r * cfg["cell_y"]),
+    print()
+    print("③ 조각 패널 왼쪽 위에 마우스를 놓고 Enter")
+    input()
+
+    px0, py0 = pyautogui.position()
+
+    print()
+    print("④ 조각 패널 오른쪽 아래에 마우스를 놓고 Enter")
+    input()
+
+    px1, py1 = pyautogui.position()
+
+    config["panel_x0"] = min(px0, px1)
+    config["panel_y0"] = min(py0, py1)
+    config["panel_x1"] = max(px0, px1)
+    config["panel_y1"] = max(py0, py1)
+
+    print()
+    print("⑤ 슬롯 1 회전 버튼에 마우스를 놓고 Enter")
+    input()
+    config["rotate_x"], config["rotate_y"][0] = pyautogui.position()
+
+    print("⑥ 슬롯 2 회전 버튼")
+    input()
+    _, config["rotate_y"][1] = pyautogui.position()
+
+    print("⑦ 슬롯 3 회전 버튼")
+    input()
+    _, config["rotate_y"][2] = pyautogui.position()
+
+    print()
+    print("⑧ 슬롯 1 뒤집기 버튼")
+    input()
+    _, config["flip_y"][0] = pyautogui.position()
+
+    print("⑨ 슬롯 2 뒤집기 버튼")
+    input()
+    _, config["flip_y"][1] = pyautogui.position()
+
+    print("⑩ 슬롯 3 뒤집기 버튼")
+    input()
+    _, config["flip_y"][2] = pyautogui.position()
+
+    print()
+    print("⑪ 한 칸 스킬 버튼")
+    input()
+    config["dot_button"] = list(
+        pyautogui.position()
     )
 
+    print()
+    print("⑫ 바꿔 뽑기 버튼")
+    input()
+    config["swap_button"] = list(
+        pyautogui.position()
+    )
 
-def panel_geometry(cfg):
-    """
-    Relative layout derived from the supplied game screenshots.
-    The x/y scaling is taken from the user's own board calibration, so
-    Windows display scaling does not matter.
-    """
-    bx, by = cfg["board_x0"], cfg["board_y0"]
-    cx, cy = cfg["cell_x"], cfg["cell_y"]
+    save_config(config)
 
-    # The piece cards sit to the right of the 10x16 board.
-    panel_x1 = round(bx + 10.15 * cx)
-    panel_x2 = round(bx + 12.7 * cx)
-
-    # Three card bands. These are intentionally generous because a piece
-    # can be several cells tall.
-    bands = [
-        (by + 0.35 * cy, by + 3.65 * cy),
-        (by + 3.65 * cy, by + 6.55 * cy),
-        (by + 6.55 * cy, by + 9.55 * cy),
-    ]
-
-    # Rotate / flip buttons are to the right of the piece icon.
-    button_x = round(bx + 13.05 * cx)
-    rotate_ys = [
-        round(by + 1.75 * cy),
-        round(by + 4.85 * cy),
-        round(by + 7.75 * cy),
-    ]
-    flip_ys = [round(y + 0.92 * cy) for y in rotate_ys]
-
-    dot_button = (round(bx + 12.55 * cx), round(by + 14.15 * cy))
-    swap_button = (round(bx + 12.55 * cx), round(by + 15.45 * cy))
-
-    return {
-        "panel_x1": panel_x1,
-        "panel_x2": panel_x2,
-        "bands": bands,
-        "button_x": button_x,
-        "rotate_ys": rotate_ys,
-        "flip_ys": flip_ys,
-        "dot_button": dot_button,
-        "swap_button": swap_button,
-    }
+    print()
+    print("보정 완료.")
+    print(
+        f"보드: {config['board_x']}, "
+        f"{config['board_y']}"
+    )
+    print(
+        f"셀: {config['cell_x']:.1f} x "
+        f"{config['cell_y']:.1f}"
+    )
+    print()
 
 
-def screenshot_bgr():
-    img = pyautogui.screenshot()
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+# ============================================================
+# 보드 인식
+# ============================================================
 
+def detect_board(img, config, debug=False):
 
-def detect_board(img, cfg):
-    bx, by = cfg["board_x0"], cfg["board_y0"]
-    cx, cy = cfg["cell_x"], cfg["cell_y"]
+    bx = config["board_x"]
+    by = config["board_y"]
 
-    out = []
-    # Move the mouse away before calling this, so the cursor does not look
-    # like an occupied cell.
+    cx = config["cell_x"]
+    cy = config["cell_y"]
+
+    board = [0] * ROWS
+
     for r in range(ROWS):
-        row = 0
+
         for c in range(COLS):
-            x = round(bx + c * cx)
-            y = round(by + r * cy)
-            hw = max(5, int(cx * 0.25))
-            hh = max(5, int(cy * 0.25))
+
+            x = int(
+                bx + c * cx
+            )
+
+            y = int(
+                by + r * cy
+            )
+
+            x0 = max(
+                0,
+                int(x - cx * 0.30)
+            )
+
+            x1 = min(
+                img.shape[1],
+                int(x + cx * 0.30)
+            )
+
+            y0 = max(
+                0,
+                int(y - cy * 0.30)
+            )
+
+            y1 = min(
+                img.shape[0],
+                int(y + cy * 0.30)
+            )
+
             patch = img[
-                max(0, y - hh):y + hh + 1,
-                max(0, x - hw):x + hw + 1,
+                y0:y1,
+                x0:x1
             ]
+
             if patch.size == 0:
                 continue
 
-            # Empty cells are almost uniform in their central area.
-            # Real blocks have strong color/highlight variation.
-            p = patch.astype(np.float32)
-            std = float(p.reshape(-1, 3).std(axis=0).mean())
-            mean = p.reshape(-1, 3).mean(axis=0)
+            hsv = cv2.cvtColor(
+                patch,
+                cv2.COLOR_RGB2HSV
+            )
 
-            # A second check rejects tiny skill icons sitting in otherwise
-            # empty cells.
-            center_var = float(p.reshape(-1, 3).std(axis=0).max())
+            gray = cv2.cvtColor(
+                patch,
+                cv2.COLOR_RGB2GRAY
+            )
 
-            occupied = std > 5.0 and center_var > 3.5
-            if occupied:
-                row |= 1 << c
-        out.append(row)
-    return tuple(out)
+            saturation = float(
+                np.mean(hsv[:, :, 1])
+            )
+
+            std = float(
+                np.std(gray)
+            )
+
+            # 실제 블록이 있는 칸은 보통
+            # 빈 칸보다 색/질감 변화가 큼.
+            value = (
+                saturation * 0.65
+                + std * 0.55
+            )
+
+            if value > 25:
+                board[r] |= (1 << c)
+
+    if debug:
+
+        dbg = img.copy()
+
+        for r in range(ROWS):
+
+            for c in range(COLS):
+
+                x = int(
+                    bx + c * cx
+                )
+
+                y = int(
+                    by + r * cy
+                )
+
+                if board[r] & (1 << c):
+                    color = (255, 0, 0)
+                else:
+                    color = (0, 255, 0)
+
+                cv2.circle(
+                    dbg,
+                    (x, y),
+                    5,
+                    color,
+                    -1
+                )
+
+        save_debug(
+            "board_debug.png",
+            dbg
+        )
+
+    return tuple(board)
 
 
-def detect_piece_in_band(img, cfg, band):
-    g = panel_geometry(cfg)
-    x1, x2 = g["panel_x1"], g["panel_x2"]
-    y1, y2 = map(int, band)
+# ============================================================
+# 조각 인식
+# ============================================================
 
-    x1 = max(0, int(x1))
-    x2 = min(img.shape[1], int(x2))
-    y1 = max(0, y1)
-    y2 = min(img.shape[0], y2)
+def make_piece_mask(roi):
 
-    roi = img[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(
+        roi,
+        cv2.COLOR_RGB2HSV
+    )
+
+    h, s, v = cv2.split(hsv)
+
+    # 특정 색 하나가 아니라 넓게 잡는다.
+    mask = (
+        (s >= 55)
+        &
+        (v >= 50)
+    ).astype(
+        np.uint8
+    ) * 255
+
+    kernel = np.ones(
+        (3, 3),
+        np.uint8
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+
+    return mask
+
+
+def detect_piece_slot(
+    img,
+    config,
+    slot,
+    debug=False
+):
+
+    x0 = int(config["panel_x0"])
+    x1 = int(config["panel_x1"])
+
+    y0 = int(config["panel_y0"])
+    y1 = int(config["panel_y1"])
+
+    total_h = y1 - y0
+
+    slot_h = total_h / 3.0
+
+    sy0 = int(
+        y0 + slot * slot_h
+    )
+
+    sy1 = int(
+        y0 + (slot + 1) * slot_h
+    )
+
+    roi = img[
+        sy0:sy1,
+        x0:x1
+    ]
+
     if roi.size == 0:
         return None
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    # Block fills are strongly saturated. The white card and text are not.
-    mask = cv2.inRange(
-        hsv,
-        np.array([0, 115, 80], dtype=np.uint8),
-        np.array([179, 255, 255], dtype=np.uint8),
+    mask = make_piece_mask(roi)
+
+    count, labels, stats, centroids = (
+        cv2.connectedComponentsWithStats(
+            mask,
+            8
+        )
     )
 
-    # Remove tiny noise.
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    candidates = []
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for i in range(1, count):
 
-    cx, cy = cfg["cell_x"], cfg["cell_y"]
-    comps = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = cv2.contourArea(cnt)
-        if (
-            0.45 * cx <= w <= 1.25 * cx
-            and 0.45 * cy <= h <= 1.25 * cy
-            and 0.20 * cx * cy <= area <= 1.2 * cx * cy
-        ):
-            sx = x1 + x + w / 2
-            sy = y1 + y + h / 2
-            comps.append((sx, sy))
+        bx, by, bw, bh, area = stats[i]
 
-    if not comps:
+        if area < 35:
+            continue
+
+        if bw < 6 or bh < 6:
+            continue
+
+        if bw > roi.shape[1] * 0.9:
+            continue
+
+        if bh > roi.shape[0] * 0.9:
+            continue
+
+        candidates.append(
+            (
+                bx,
+                by,
+                bw,
+                bh,
+                area
+            )
+        )
+
+    if not candidates:
         return None
 
-    # Normalize square centers to a local lattice.
-    minx = min(x for x, y in comps)
-    miny = min(y for x, y in comps)
-    local = []
-    for x, y in comps:
-        cc = int(round((x - minx) / cx))
-        rr = int(round((y - miny) / cy))
-        local.append((rr, cc, x, y))
-
-    cells = norm_shape([(r, c) for r, c, _, _ in local])
-    # Pick a real component as the drag anchor. Keep its normalized coord.
-    anchor_raw = local[0]
-    anchor_norm = (
-        int(anchor_raw[0] - min(r for r, c in [(z[0], z[1]) for z in local])),
-        int(anchor_raw[1] - min(c for r, c in [(z[0], z[1]) for z in local])),
+    # 작은 컴포넌트 여러 개가 한 조각인 경우를
+    # 전체 bounding box로 합친다.
+    min_x = min(
+        x for x, y, w, h, a in candidates
     )
 
-    # Better anchor calculation using the normalized set.
-    raw_norms = [
-        (
-            int(round((x - minx) / cx)),
-            int(round((y - miny) / cy)),
-            x,
-            y,
-        )
-        for x, y in comps
-    ]
-    raw_min_r = min(z[0] for z in raw_norms)
-    raw_min_c = min(z[1] for z in raw_norms)
-    raw_norms = [(r - raw_min_r, c - raw_min_c, x, y) for r, c, x, y in raw_norms]
+    min_y = min(
+        y for x, y, w, h, a in candidates
+    )
 
-    ar, ac, ax, ay = raw_norms[0]
-    return {
-        "cells": cells,
-        "anchor": (ar, ac),
-        "source_xy": (int(ax), int(ay)),
-        "center_xy": (
-            int(np.mean([z[2] for z in raw_norms])),
-            int(np.mean([z[3] for z in raw_norms])),
-        ),
-    }
+    max_x = max(
+        x + w
+        for x, y, w, h, a in candidates
+    )
 
+    max_y = max(
+        y + h
+        for x, y, w, h, a in candidates
+    )
 
-def detect_pieces(img, cfg):
-    g = panel_geometry(cfg)
-    pieces = []
-    for slot, band in enumerate(g["bands"]):
-        d = detect_piece_in_band(img, cfg, band)
-        if d:
-            pieces.append(
-                Piece(
-                    slot=slot,
-                    cells=tuple(d["cells"]),
-                    anchor=tuple(d["anchor"]),
-                    source_xy=tuple(d["source_xy"]),
+    # 너무 작은 검출은 무시
+    if max_x - min_x < 10:
+        return None
+
+    if max_y - min_y < 10:
+        return None
+
+    # 셀 크기를 기준으로 조각 형태 추정
+    cell_x = max(
+        8,
+        config["cell_x"]
+    )
+
+    cell_y = max(
+        8,
+        config["cell_y"]
+    )
+
+    width = max_x - min_x
+    height = max_y - min_y
+
+    cols = max(
+        1,
+        min(
+            6,
+            int(
+                round(
+                    width / cell_x
                 )
             )
-    return pieces
-
-
-def wait_board_stable(cfg, timeout=1.2):
-    pyautogui.moveTo(
-        round(cfg["board_x0"] + 12.0 * cfg["cell_x"]),
-        round(cfg["board_y0"] + 10.0 * cfg["cell_y"]),
-        duration=0,
+        )
     )
-    last = None
-    stable = 0
-    deadline = time.time() + timeout
-    while time.time() < deadline and not STOP.is_set():
-        img = screenshot_bgr()
-        b = detect_board(img, cfg)
-        if b == last:
-            stable += 1
-            if stable >= 2:
-                return b
-        else:
-            stable = 0
-            last = b
-        time.sleep(0.08)
-    return last
+
+    rows = max(
+        1,
+        min(
+            6,
+            int(
+                round(
+                    height / cell_y
+                )
+            )
+        )
+    )
+
+    shape = []
+
+    for r in range(rows):
+
+        for c in range(cols):
+
+            cx = int(
+                min_x
+                + (c + 0.5) * cell_x
+            )
+
+            cy = int(
+                min_y
+                + (r + 0.5) * cell_y
+            )
+
+            rx = max(
+                3,
+                int(cell_x * 0.30)
+            )
+
+            ry = max(
+                3,
+                int(cell_y * 0.30)
+            )
+
+            ax0 = max(
+                0,
+                cx - rx
+            )
+
+            ax1 = min(
+                roi.shape[1],
+                cx + rx
+            )
+
+            ay0 = max(
+                0,
+                cy - ry
+            )
+
+            ay1 = min(
+                roi.shape[0],
+                cy + ry
+            )
+
+            patch = mask[
+                ay0:ay1,
+                ax0:ax1
+            ]
+
+            if patch.size == 0:
+                continue
+
+            ratio = (
+                np.count_nonzero(patch)
+                /
+                float(patch.size)
+            )
+
+            if ratio > 0.12:
+                shape.append(
+                    (r, c)
+                )
+
+    shape = normalize_shape(shape)
+
+    if not shape:
+        return None
+
+    if len(shape) > 12:
+        return None
+
+    source_x = (
+        x0
+        + (min_x + max_x) // 2
+    )
+
+    source_y = (
+        sy0
+        + (min_y + max_y) // 2
+    )
+
+    confidence = min(
+        1.0,
+        0.4
+        + len(shape) * 0.04
+    )
+
+    piece = Piece(
+        slot=slot,
+        cells=shape,
+        source_xy=(
+            source_x,
+            source_y
+        ),
+        bbox=(
+            x0 + min_x,
+            sy0 + min_y,
+            x0 + max_x,
+            sy0 + max_y
+        ),
+        confidence=confidence
+    )
+
+    if debug:
+
+        dbg = img.copy()
+
+        bx1, by1, bx2, by2 = piece.bbox
+
+        cv2.rectangle(
+            dbg,
+            (bx1, by1),
+            (bx2, by2),
+            (255, 0, 0),
+            2
+        )
+
+        cv2.putText(
+            dbg,
+            f"S{slot+1} {piece.cells}",
+            (bx1, max(20, by1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            1
+        )
+
+        save_debug(
+            f"piece_{slot+1}.png",
+            dbg
+        )
+
+    return piece
 
 
-def click_rotate_or_flip(cfg, slot, current, target):
-    g = panel_geometry(cfg)
-    seq = find_transform_sequence(current, target)
+def detect_pieces(
+    img,
+    config,
+    debug=False
+):
 
-    for action in seq:
-        if STOP.is_set():
-            return False
-        if action == "R":
-            xy = (g["button_x"], g["rotate_ys"][slot])
-        else:
-            xy = (g["button_x"], g["flip_ys"][slot])
-        pyautogui.click(*xy)
+    result = []
+
+    for slot in range(3):
+
+        piece = detect_piece_slot(
+            img,
+            config,
+            slot,
+            debug
+        )
+
+        if piece:
+            result.append(piece)
+
+    return result
+
+
+# ============================================================
+# 마우스
+# ============================================================
+
+def click(x, y, dry_run=False):
+
+    if dry_run:
+        print(
+            f"[DRY] CLICK {x},{y}"
+        )
+        return
+
+    pyautogui.click(
+        int(x),
+        int(y)
+    )
+
+
+def rotate_or_flip(
+    piece,
+    target,
+    config,
+    dry_run=False
+):
+
+    sequence = transform_sequence(
+        piece.cells,
+        target
+    )
+
+    if sequence is None:
+        return False
+
+    slot = piece.slot
+
+    for op in sequence:
+
+        if op == "R":
+
+            click(
+                config["rotate_x"],
+                config["rotate_y"][slot],
+                dry_run
+            )
+
+        elif op == "F":
+
+            click(
+                config["rotate_x"],
+                config["flip_y"][slot],
+                dry_run
+            )
+
         time.sleep(0.10)
+
     return True
 
 
-def drag_piece(cfg, piece, target_shape, top, left):
-    # Transform the piece before dragging.
-    if not click_rotate_or_flip(cfg, piece.slot, piece.cells, target_shape):
-        return False
+def drag_piece(
+    piece,
+    target,
+    row,
+    col,
+    config,
+    dry_run=False
+):
 
-    # We need to know where the chosen anchor block ended up after
-    # transformation. Recompute it by transforming the anchor coordinate.
-    s = piece.cells
-    a = piece.anchor
-    # Find where that specific anchor block maps under the same action sequence.
-    seq = find_transform_sequence(piece.cells, target_shape)
-    ar, ac = a
-    for action in seq:
-        if action == "R":
-            ar, ac = ac, -ar
-        else:
-            ar, ac = ar, -ac
+    bx = config["board_x"]
+    by = config["board_y"]
 
-    # Normalize the transformed anchor together with the target shape.
-    allr = [r for r, c in target_shape]
-    allc = [c for r, c in target_shape]
-    minr, minc = min(allr), min(allc)
-    ar -= minr
-    ac -= minc
+    cx = config["cell_x"]
+    cy = config["cell_y"]
 
-    # Source coordinate is the original block we clicked. The actual
-    # panel piece has rotated in place, so after transformation the chosen
-    # anchor is still at the corresponding relative cell.
-    tx, ty = board_center(cfg, top + ar, left + ac)
-
-    pyautogui.moveTo(*piece.source_xy, duration=0.05)
-    pyautogui.mouseDown()
-    pyautogui.moveTo(tx, ty, duration=0.18)
-    pyautogui.mouseUp()
-    time.sleep(0.16)
-    return True
-
-
-def button_region(cfg, which):
-    g = panel_geometry(cfg)
-    x, y = g["dot_button"] if which == "dot" else g["swap_button"]
-    cx, cy = cfg["cell_x"], cfg["cell_y"]
-    # The count digit sits toward the right side of the pill button.
-    return (
-        int(x - 0.9 * cx),
-        int(y - 0.45 * cy),
-        int(x + 1.0 * cx),
-        int(y + 0.45 * cy),
+    target_x = (
+        bx
+        + (col + 0.5) * cx
     )
 
+    target_y = (
+        by
+        + (row + 0.5) * cy
+    )
 
-def crop_region(img, box):
-    x1, y1, x2, y2 = box
-    return img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+    sx, sy = piece.source_xy
 
+    print(
+        f"드래그 "
+        f"S{piece.slot+1}: "
+        f"({sx},{sy}) -> "
+        f"({int(target_x)},{int(target_y)})"
+    )
 
-def skill_baseline(img, cfg):
-    return {
-        "dot": crop_region(img, button_region(cfg, "dot")).copy(),
-        "swap": crop_region(img, button_region(cfg, "swap")).copy(),
-    }
+    if dry_run:
+        return
 
+    pyautogui.moveTo(
+        sx,
+        sy,
+        duration=0.12
+    )
 
-def skill_changed(img, cfg, baseline, which):
-    ref = baseline.get(which)
-    cur = crop_region(img, button_region(cfg, which))
-    if ref is None or cur.size == 0 or ref.size == 0 or cur.shape != ref.shape:
-        return False
-    a = cv2.absdiff(cur, ref).astype(np.float32)
-    # The background stays essentially identical; the count glyph changes.
-    return float(a.mean()) > 2.0
+    pyautogui.mouseDown()
 
+    pyautogui.moveTo(
+        target_x,
+        target_y,
+        duration=0.30
+    )
 
-def use_dot(cfg, target):
-    g = panel_geometry(cfg)
-    pyautogui.click(*g["dot_button"])
-    time.sleep(0.08)
-    pyautogui.click(*board_center(cfg, target[0], target[1]))
-    time.sleep(0.25)
-
-
-def use_swap(cfg, piece):
-    g = panel_geometry(cfg)
-    pyautogui.click(*g["swap_button"])
-    time.sleep(0.08)
-    pyautogui.click(*piece.source_xy)
-    time.sleep(0.35)
+    pyautogui.mouseUp()
 
 
-def find_one_gap_row(board):
-    for r, bits in enumerate(board):
-        if bits.bit_count() == COLS - 1:
-            for c in range(COLS):
-                if not (bits & (1 << c)):
-                    return r, c
+# ============================================================
+# 스킬
+# ============================================================
+
+def use_skill(
+    config,
+    name,
+    dry_run=False
+):
+
+    if name == "dot":
+        x, y = config["dot_button"]
+
+    else:
+        x, y = config["swap_button"]
+
+    print(
+        f"스킬 사용: {name}"
+    )
+
+    click(
+        x,
+        y,
+        dry_run
+    )
+
+    time.sleep(0.45)
+
+
+def one_gap(board):
+
+    for r in range(ROWS):
+
+        empty = (
+            FULL_MASK
+            ^ board[r]
+        )
+
+        if empty.bit_count() == 1:
+
+            c = (
+                empty
+                & -empty
+            ).bit_length() - 1
+
+            return r, c
+
     return None
 
 
-def has_clear_move(board, pieces):
-    for p in pieces:
-        for o in all_orientations(p.cells):
-            for _, _, _, cleared in legal_moves(board, o):
+def has_clear_move(
+    board,
+    pieces
+):
+
+    for piece in pieces:
+
+        for shape in orientations(
+            piece.cells
+        ):
+
+            for _, _, _, cleared in legal_moves(
+                board,
+                shape
+            ):
+
                 if cleared:
                     return True
+
     return False
 
 
-def print_debug(cfg):
-    pyautogui.moveTo(
-        round(cfg["board_x0"] + 12.0 * cfg["cell_x"]),
-        round(cfg["board_y0"] + 11.0 * cfg["cell_y"]),
-        duration=0,
-    )
-    time.sleep(0.15)
-    img = screenshot_bgr()
-    board = detect_board(img, cfg)
-    pieces = detect_pieces(img, cfg)
-    print("\n--- DEBUG ---")
-    print("board rows (top -> bottom):")
-    for row in board:
-        print(format(row, f"0{COLS}b")[::-1])
-    print("pieces:")
-    for p in pieces:
-        print(f" slot={p.slot+1} cells={p.cells} anchor={p.anchor} src={p.source_xy}")
-    print("------------\n")
+# ============================================================
+# 핫키
+# ============================================================
+
+class Controller:
+
+    def __init__(self):
+        self.pause = False
+        self.stop = False
+        self.recalibrate = False
 
 
-def setup_hotkeys():
+def install_hotkeys(ctrl):
+
     if keyboard is None:
-        print("주의: keyboard 모듈을 불러오지 못했습니다. F8/F9 전역키는 사용할 수 없습니다.")
-        return
-    try:
-        keyboard.add_hotkey("f9", STOP.set)
-        keyboard.add_hotkey("f8", lambda: (PAUSE.set() if not PAUSE.is_set() else PAUSE.clear()))
-        keyboard.add_hotkey("f6", lambda: calibrate())
-    except Exception as e:
-        print("전역 단축키 설정 실패:", e)
-
-
-def wait_if_paused():
-    while PAUSE.is_set() and not STOP.is_set():
-        time.sleep(0.15)
-
-
-def run_bot(cfg, dry_run=False):
-    setup_hotkeys()
-
-    print("\n5초 후 시작합니다.")
-    print("F8 = 일시정지/재개, F9 = 즉시 정지, F6 = 재보정")
-    for n in range(5, 0, -1):
-        print(n)
-        time.sleep(1)
-
-    # Start with cursor away from the board.
-    pyautogui.moveTo(
-        round(cfg["board_x0"] + 12.5 * cfg["cell_x"]),
-        round(cfg["board_y0"] + 12.0 * cfg["cell_y"]),
-        duration=0,
-    )
-    img0 = screenshot_bgr()
-    baseline = skill_baseline(img0, cfg)
-
-    placement_count = 0
-
-    while not STOP.is_set():
-        wait_if_paused()
-        if STOP.is_set():
-            break
-
-        pyautogui.moveTo(
-            round(cfg["board_x0"] + 12.0 * cfg["cell_x"]),
-            round(cfg["board_y0"] + 11.0 * cfg["cell_y"]),
-            duration=0,
-        )
-        img = screenshot_bgr()
-        board = detect_board(img, cfg)
-        pieces = detect_pieces(img, cfg)
-
-        if not pieces:
-            # Either the round ended or the UI is mid-animation.
-            time.sleep(0.35)
-            continue
-
-        # Strategic use of "점 찍기": if no currently-held piece can clear
-        # a row but a row has exactly one empty cell, use the skill to clear it.
-        if not dry_run and skill_changed(img, cfg, baseline, "dot"):
-            gap = find_one_gap_row(board)
-            if gap and not has_clear_move(board, pieces):
-                print("점 찍기:", gap)
-                use_dot(cfg, gap)
-                wait_board_stable(cfg)
-                continue
-
-        # If no piece can be placed at all, use "바꿔 뽑기" if available.
-        any_move = False
-        for p in pieces:
-            if any(legal_moves(board, o) for o in all_orientations(p.cells)):
-                any_move = True
-                break
-
-        if not any_move:
-            if not dry_run and skill_changed(img, cfg, baseline, "swap"):
-                # Replace the largest piece first; it is the hardest one to
-                # place when the board is tight.
-                p = max(pieces, key=lambda z: z.size)
-                print("바꿔 뽑기: slot", p.slot + 1)
-                use_swap(cfg, p)
-                continue
-
-            print("더 이상 놓을 수 있는 조각이 없습니다. 종료.")
-            break
-
-        # Solve the current set.
-        result = solve_current_pieces(board, pieces)
-        if result is None:
-            print("해결할 수 있는 수를 찾지 못했습니다.")
-            break
-
-        _, _, _, first = result
-        if first is None:
-            break
-
-        slot, target_shape, top, left = first
-        piece = next((p for p in pieces if p.slot == slot), None)
-        if piece is None:
-            continue
 
         print(
-            f"#{placement_count+1}: slot={slot+1}, "
-            f"shape={target_shape}, pos=({top},{left}), cells={len(target_shape)}"
+            "keyboard 모듈 없음 - "
+            "F8/F9/F6 사용 불가"
         )
 
-        if dry_run:
-            placement_count += 1
-            # Do not actually change the board in dry-run.
-            time.sleep(0.15)
-            break
-
-        ok = drag_piece(cfg, piece, target_shape, top, left)
-        if not ok:
-            break
-
-        placement_count += 1
-        wait_board_stable(cfg)
-
-    print("봇 종료. 총 배치 시도:", placement_count)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--calibrate", action="store_true", help="보드 좌표 재보정")
-    parser.add_argument("--debug", action="store_true", help="현재 화면에서 보드/조각 인식만 출력")
-    parser.add_argument("--dry-run", action="store_true", help="마우스를 움직이지 않고 첫 수만 계산")
-    args = parser.parse_args()
-
-    cfg = load_config()
-    if args.calibrate or cfg is None:
-        cfg = calibrate()
-
-    if args.debug:
-        print_debug(cfg)
         return
 
-    run_bot(cfg, dry_run=args.dry_run)
+    keyboard.add_hotkey(
+        "f8",
+        lambda: setattr(
+            ctrl,
+            "pause",
+            not ctrl.pause
+        )
+    )
+
+    keyboard.add_hotkey(
+        "f9",
+        lambda: setattr(
+            ctrl,
+            "stop",
+            True
+        )
+    )
+
+    keyboard.add_hotkey(
+        "f6",
+        lambda: setattr(
+            ctrl,
+            "recalibrate",
+            True
+        )
+    )
+
+
+# ============================================================
+# 출력
+# ============================================================
+
+def print_board(board):
+
+    print()
+
+    for r in range(ROWS):
+
+        line = ""
+
+        for c in range(COLS):
+
+            if board[r] & (1 << c):
+                line += "■"
+            else:
+                line += "·"
+
+        print(
+            f"{r:02d} {line}"
+        )
+
+
+def print_pieces(pieces):
+
+    if not pieces:
+
+        print(
+            "조각: 없음"
+        )
+
+        return
+
+    for p in pieces:
+
+        print(
+            f"S{p.slot+1} "
+            f"{p.cells} "
+            f"src={p.source_xy} "
+            f"conf={p.confidence:.2f}"
+        )
+
+
+# ============================================================
+# 메인
+# ============================================================
+
+def run(
+    config,
+    debug=False,
+    dry_run=False
+):
+
+    ctrl = Controller()
+
+    install_hotkeys(ctrl)
+
+    print()
+    print("=" * 60)
+    print("한글 모아모아 봇")
+    print("=" * 60)
+    print()
+    print("F8 : 일시정지 / 재개")
+    print("F9 : 종료")
+    print("F6 : 재보정")
+    print()
+
+    print(
+        "5초 후 시작..."
+    )
+
+    for i in range(5, 0, -1):
+
+        print(i)
+
+        time.sleep(1)
+
+    fail_count = 0
+
+    while not ctrl.stop:
+
+        if ctrl.pause:
+
+            time.sleep(0.15)
+
+            continue
+
+        if ctrl.recalibrate:
+
+            ctrl.recalibrate = False
+
+            try:
+                calibrate(config)
+
+            except Exception:
+                traceback.print_exc()
+
+            continue
+
+        img = screenshot()
+
+        board = detect_board(
+            img,
+            config,
+            debug
+        )
+
+        pieces = detect_pieces(
+            img,
+            config,
+            debug
+        )
+
+        if debug:
+
+            print_board(board)
+            print_pieces(pieces)
+
+        # ----------------------------------------------------
+        # 조각 인식 실패
+        # ----------------------------------------------------
+
+        if not pieces:
+
+            fail_count += 1
+
+            if (
+                fail_count == 1
+                or fail_count % 10 == 0
+            ):
+
+                print(
+                    f"조각 인식 실패 "
+                    f"{fail_count}회"
+                )
+
+                if debug:
+
+                    save_debug(
+                        "piece_fail.png",
+                        img
+                    )
+
+            time.sleep(0.25)
+
+            continue
+
+        fail_count = 0
+
+        # ----------------------------------------------------
+        # 최적 수 찾기
+        # ----------------------------------------------------
+
+        move = solve(
+            board,
+            pieces
+        )
+
+        # ----------------------------------------------------
+        # 둘 곳 없음
+        # ----------------------------------------------------
+
+        if move is None:
+
+            print(
+                "현재 조각으로 배치 불가"
+            )
+
+            gap = one_gap(board)
+
+            if (
+                gap is not None
+                and not has_clear_move(
+                    board,
+                    pieces
+                )
+            ):
+
+                use_skill(
+                    config,
+                    "dot",
+                    dry_run
+                )
+
+                continue
+
+            use_skill(
+                config,
+                "swap",
+                dry_run
+            )
+
+            continue
+
+        slot, target_shape, row, col = move
+
+        piece = None
+
+        for p in pieces:
+
+            if p.slot == slot:
+
+                piece = p
+                break
+
+        if piece is None:
+
+            print(
+                "선택한 조각 재인식 실패"
+            )
+
+            time.sleep(0.2)
+
+            continue
+
+        print()
+        print(
+            f"선택 S{slot+1}"
+        )
+
+        print(
+            f"모양: {target_shape}"
+        )
+
+        print(
+            f"위치: row={row}, col={col}"
+        )
+
+        # ----------------------------------------------------
+        # 회전 / 뒤집기
+        # ----------------------------------------------------
+
+        if not rotate_or_flip(
+            piece,
+            target_shape,
+            config,
+            dry_run
+        ):
+
+            print(
+                "회전/반전 변환 실패"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # 드래그
+        # ----------------------------------------------------
+
+        drag_piece(
+            piece,
+            target_shape,
+            row,
+            col,
+            config,
+            dry_run
+        )
+
+        time.sleep(0.40)
+
+    print(
+        "봇 종료"
+    )
+
+
+# ============================================================
+# 시작
+# ============================================================
+
+def main():
+
+    set_dpi_awareness()
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--calibrate",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true"
+    )
+
+    args = parser.parse_args()
+
+    config = load_config()
+
+    if (
+        args.calibrate
+        or not CONFIG_FILE.exists()
+    ):
+
+        calibrate(config)
+
+    run(
+        config,
+        debug=args.debug,
+        dry_run=args.dry_run
+    )
 
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "종료"
+        )
+
+    except Exception:
+
+        print()
+        print("=" * 60)
+        print("오류 발생")
+        print("=" * 60)
+
+        traceback.print_exc()
+
+        try:
+            input(
+                "\nEnter를 누르면 종료합니다..."
+            )
+        except Exception:
+            pass
