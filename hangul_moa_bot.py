@@ -873,7 +873,7 @@ def main():
 
             time.sleep(0.25)
 
-    log("HangulMoaBot V2 종료")
+        log("HangulMoaBot V2 종료")
 
 
 if __name__ == "__main__":
