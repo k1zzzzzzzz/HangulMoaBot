@@ -24,10 +24,10 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --clean --onefile hangul_moa_bot.py
+          pyinstaller --clean --onefile --console --name HangulMoaBot hangul_moa_bot.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: HangulMoaBot-Windows
-          path: dist/hangul_moa_bot.exe
+          path: dist/HangulMoaBot.exe
