@@ -22,103 +22,45 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # hangul_moa_bot.py의 알려진 오류를 빌드 전에 자동 수정
-      - name: Patch bot source
+      - name: Patch solver bug
         shell: pwsh
         run: |
-          python -c @'
-          from pathlib import Path
+          $file = "hangul_moa_bot.py"
+          $text = Get-Content $file -Raw
 
-          p = Path("hangul_moa_bot.py")
-          s = p.read_text(encoding="utf-8")
+          $old = "best = max(states, key=lambda x: evaluate_state(x[0], x[3], []))"
+          $new = "best = max(states, key=lambda x: evaluate_state(x[0], x[2], []))"
 
-          # ------------------------------------------------------------
-          # FIX 1
-          # evaluate_state()에 score 대신 first_move(tuple)가 들어가던 오류
-          #
-          # 기존:
-          #   evaluate_state(x[0], x[3], [])
-          #
-          # x 구조:
-          #   (board, used, score, first_move, depth)
-          #
-          # 따라서 score는 x[2]
-          # ------------------------------------------------------------
-          old = "best=max(states,key=lambda x:evaluate_state(x[0],x[3],[]))"
-          new = "best=max(states,key=lambda x:evaluate_state(x[0],x[2],[]))"
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Write-Host "Solver FIX applied"
+          }
+          elseif ($text.Contains($new)) {
+            Write-Host "Solver FIX already applied"
+          }
+          else {
+            throw "Solver FIX target not found"
+          }
 
-          if old in s:
-              s = s.replace(old, new)
-              print("[PATCH] FIX 1 applied")
-          elif new in s:
-              print("[PATCH] FIX 1 already applied")
-          else:
-              raise RuntimeError("FIX 1 대상 코드를 찾지 못했습니다.")
+          $old = "            int(round((x - minx) / cx)),`n            int(round((y - miny) / cy)),"
+          $new = "            int(round((y - miny) / cy)),`n            int(round((x - minx) / cx)),"
 
-          # ------------------------------------------------------------
-          # FIX 2
-          # solve_current_pieces()가 depth를 반환해서
-          # main에서 first_move가 깨지는 문제 수정
-          #
-          # 기존:
-          #   return best[3],best[2],best[3],best[4]
-          #
-          # main에서는:
-          #   _, _, _, first = result
-          #
-          # 따라서 마지막 값은 best[3] (first_move)여야 함.
-          # ------------------------------------------------------------
-          old = "return best[3],best[2],best[3],best[4]"
-          new = "return best[3],best[2],best[3],best[3]"
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Write-Host "Piece coordinate FIX applied"
+          }
+          elseif ($text.Contains($new)) {
+            Write-Host "Piece coordinate FIX already applied"
+          }
+          else {
+            throw "Piece coordinate FIX target not found"
+          }
 
-          if old in s:
-              s = s.replace(old, new)
-              print("[PATCH] FIX 2 applied")
-          elif new in s:
-              print("[PATCH] FIX 2 already applied")
-          else:
-              raise RuntimeError("FIX 2 대상 코드를 찾지 못했습니다.")
+          Set-Content $file $text -Encoding UTF8
 
-          # ------------------------------------------------------------
-          # FIX 3
-          # 조각 인식 시 row/col 좌표가 뒤집혀 있던 문제 수정
-          # ------------------------------------------------------------
-          old = """raw_norms = [
-        (
-            int(round((x - minx) / cx)),
-            int(round((y - miny) / cy)),
-            x,
-            y,
-        )
-        for x, y in comps
-    ]"""
+          Write-Host "All patches completed."
 
-          new = """raw_norms = [
-        (
-            int(round((y - miny) / cy)),
-            int(round((x - minx) / cx)),
-            x,
-            y,
-        )
-        for x, y in comps
-    ]"""
-
-          if old in s:
-              s = s.replace(old, new)
-              print("[PATCH] FIX 3 applied")
-          elif new in s:
-              print("[PATCH] FIX 3 already applied")
-          else:
-              raise RuntimeError("FIX 3 대상 코드를 찾지 못했습니다.")
-
-          p.write_text(s, encoding="utf-8")
-
-          print("")
-          print("===== PATCH COMPLETE =====")
-          print("hangul_moa_bot.py 수정 완료")
-          '@
-
-      - name: Check patched source
+      - name: Check Python syntax
         run: |
           python -m py_compile hangul_moa_bot.py
 
