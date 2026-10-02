@@ -22,113 +22,133 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Fix bot source
+      - name: Fix solver
         shell: pwsh
         run: |
           $file = "hangul_moa_bot.py"
           $text = Get-Content $file -Raw
-
-          # ============================================================
-          # FIX 1
-          # solver에서 first_move(tuple)를 score로 사용하던 버그
-          # ============================================================
 
           $old = "best = max(states, key=lambda x: evaluate_state(x[0], x[3], []))"
           $new = "best = max(states, key=lambda x: evaluate_state(x[0], x[2], []))"
 
           if ($text.Contains($old)) {
             $text = $text.Replace($old, $new)
-            Write-Host "FIX 1: solver score fixed"
+            Write-Host "SOLVER FIX APPLIED"
           }
           elseif ($text.Contains($new)) {
-            Write-Host "FIX 1: already fixed"
+            Write-Host "SOLVER FIX ALREADY APPLIED"
           }
           else {
-            throw "FIX 1 target not found"
+            throw "Solver fix target not found"
           }
-
-
-          # ============================================================
-          # FIX 2
-          # solve_current_pieces()가 depth를 반환하던 버그
-          #
-          # State:
-          # (board, used, score, first_move, depth)
-          #
-          # main()에서는 네 번째 반환값을 first_move로 사용하므로
-          # 마지막 반환값은 best[3]이어야 한다.
-          # ============================================================
-
-          $old = "return best[3], best[2], best[3], best[4]"
-          $new = "return best[3], best[2], best[3], best[3]"
-
-          if ($text.Contains($old)) {
-            $text = $text.Replace($old, $new)
-            Write-Host "FIX 2: first_move return fixed"
-          }
-          elseif ($text.Contains($new)) {
-            Write-Host "FIX 2: already fixed"
-          }
-          else {
-            throw "FIX 2 target not found"
-          }
-
-
-          # ============================================================
-          # FIX 3
-          # 조각 인식의 raw_norms row/column 순서 수정
-          # ============================================================
-
-          $old = "int(round((x - minx) / cx)),`r`n            int(round((y - miny) / cy)),"
-          $new = "int(round((y - miny) / cy)),`r`n            int(round((x - minx) / cx)),"
-
-          if ($text.Contains($old)) {
-            $text = $text.Replace($old, $new)
-            Write-Host "FIX 3: piece coordinates fixed"
-          }
-          elseif ($text.Contains($new)) {
-            Write-Host "FIX 3: already fixed"
-          }
-          else {
-            Write-Host "FIX 3: exact formatting not found - skipping"
-          }
-
-
-          # ============================================================
-          # DEBUG
-          # 조각 인식 실패 시 콘솔에 상태 표시
-          # ============================================================
-
-          $old = "if not pieces:`r`n            # Either the round ended or the UI is mid-animation.`r`n            time.sleep(0.35)`r`n            continue"
-
-          $new = "if not pieces:`r`n            print('조각 인식 실패 - 패널 위치/색상 인식 확인 중...')`r`n            time.sleep(0.35)`r`n            continue"
-
-          if ($text.Contains($old)) {
-            $text = $text.Replace($old, $new)
-            Write-Host "DEBUG: piece detection message added"
-          }
-          else {
-            Write-Host "DEBUG: piece detection block formatting differs - skipped"
-          }
-
 
           Set-Content $file $text -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "ALL SOURCE PATCHES COMPLETE"
-          Write-Host "========================================"
+      - name: Add detector debug
+        shell: pwsh
+        run: |
+          $file = "hangul_moa_bot.py"
+          $text = Get-Content $file -Raw
 
+          $old = @"
+    mask = cv2.inRange(
+        hsv,
+        np.array([0, 115, 80], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+"@
+
+          $new = @"
+    # More tolerant color detection.
+    # The original threshold was too strict for the actual game UI.
+    mask = cv2.inRange(
+        hsv,
+        np.array([0, 60, 50], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+"@
+
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Write-Host "COLOR THRESHOLD FIX APPLIED"
+          }
+          else {
+            Write-Host "COLOR THRESHOLD TARGET NOT FOUND"
+          }
+
+          $old = @"
+        if (
+            0.45 * cx <= w <= 1.25 * cx
+            and 0.45 * cy <= h <= 1.25 * cy
+            and 0.20 * cx * cy <= area <= 1.2 * cx * cy
+        ):
+"@
+
+          $new = @"
+        if (
+            0.25 * cx <= w <= 2.5 * cx
+            and 0.25 * cy <= h <= 2.5 * cy
+            and 0.05 * cx * cy <= area <= 4.0 * cx * cy
+        ):
+"@
+
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Write-Host "CONTOUR FILTER FIX APPLIED"
+          }
+          else {
+            Write-Host "CONTOUR FILTER TARGET NOT FOUND"
+          }
+
+          Set-Content $file $text -Encoding UTF8
+
+      - name: Add detection logging
+        shell: pwsh
+        run: |
+          $file = "hangul_moa_bot.py"
+          $text = Get-Content $file -Raw
+
+          $old = @"
+        if not pieces:
+            # Either the round ended or the UI is mid-animation.
+            time.sleep(0.35)
+            continue
+"@
+
+          $new = @"
+        if not pieces:
+            print(
+                "조각 인식 실패 | "
+                f"board=({cfg['board_x0']},{cfg['board_y0']}) "
+                f"cell=({cfg['cell_x']:.2f},{cfg['cell_y']:.2f})"
+            )
+            g = panel_geometry(cfg)
+            print(
+                "panel="
+                f"x:{g['panel_x1']}~{g['panel_x2']} "
+                f"bands:{g['bands']}"
+            )
+            time.sleep(0.7)
+            continue
+"@
+
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Write-Host "DETECTION LOGGING ADDED"
+          }
+          else {
+            Write-Host "DETECTION LOGGING TARGET NOT FOUND"
+          }
+
+          Set-Content $file $text -Encoding UTF8
 
       - name: Check Python syntax
         run: |
           python -m py_compile hangul_moa_bot.py
 
-
       - name: Build EXE
         run: |
           pyinstaller --clean --onefile hangul_moa_bot.py
-
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
